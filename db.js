@@ -53,6 +53,9 @@ async function init() {
     );
   `);
 
+  // Unique per user+name (your upsert depends on this)
+  await run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_items_user_name ON items(user_id, name);`);
+
   // Secondary indexes (help list/find)
   await run(`CREATE INDEX IF NOT EXISTS idx_items_user_category ON items(user_id, category);`);
   await run(`CREATE INDEX IF NOT EXISTS idx_items_user_location ON items(user_id, location);`);
