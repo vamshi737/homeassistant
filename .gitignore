@@ -1,2 +1,16 @@
+# Node
 node_modules/
+npm-debug.log*
+
+# Env / secrets
 .env
+
+# SQLite DB + WAL
+homebot.db
+homebot.db-*
+*.sqlite
+*.sqlite-*
+
+# Editor/OS
+.vscode/
+.DS_Store
