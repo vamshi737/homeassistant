@@ -1,17 +1,47 @@
-# Node
+# ----------------------------
+# Node / build artifacts
+# ----------------------------
 node_modules/
 npm-debug.log*
+logs/
+*.log
+pids/
+*.pid
+*.seed
+dist/
+build/
+coverage/
 
+# ----------------------------
 # Env / secrets
+# ----------------------------
 .env
+.env.*
+!.env.example
 
+# ----------------------------
 # SQLite DB + WAL
+# ----------------------------
 homebot.db
 homebot.db-*
 *.sqlite
 *.sqlite-*
 
-# Editor/OS
+# ----------------------------
+# Uploaded files (keep placeholder only)
+# ----------------------------
+uploads/
+!uploads/.gitkeep
+
+# ----------------------------
+# Editor / OS noise
+# ----------------------------
 .vscode/
+.idea/
 .DS_Store
+Thumbs.db
+
+# ----------------------------
+# Local backups
+# ----------------------------
 backup/
