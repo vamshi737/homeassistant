@@ -1,77 +1,105 @@
 // extractors.js
-const BRANDS = [
-  'Apple','Anker','Philips','Rust-Oleum','KILZ','Samsung','Sony','LG','Bosch','Makita','DEWALT',
-  'Acer','Asus','Lenovo','Dell','HP','Dyson','NETGEAR','TP-Link'
+function cap(s) { return s ? s[0].toUpperCase() + s.slice(1).toLowerCase() : s; }
+function title(s) { return s.replace(/\s+/g,' ').trim().split(' ').map(cap).join(' '); }
+
+const BRAND_LIST = [
+  'Apple','Onn','Mi','Xiaomi','Philips','Belkin','Anker','Logitech','Samsung','Sony',
+  'Meridian','Boat','JBL','Google','Razer','HP','Dell','Lenovo','Acer','Asus','Amazon',
+  'TP-Link','Netgear','Realme','OnePlus'
 ];
 
-const COLORS = [
-  'black','white','blue','red','green','yellow','orange','purple','pink','gray','grey',
-  'silver','gold','beige','brown','navy','teal','maroon'
-];
-
-// simple keyword → category map
-const CATEGORY_MAP = [
-  { kw: ['primer','kilz','rust-oleum','paint','spray'], category: 'paint' },
-  { kw: ['power bank','mah','charger','usb-c','usb a','lightning',' w'], category: 'electronics' },
-  { kw: ['bulb','led','lamp'], category: 'electrical' },
-  { kw: ['screw','nail','drill','hammer'], category: 'tools' },
-  { kw: ['router','modem'], category: 'network' },
-];
-
-function findBrand(text) {
-  const t = text.toLowerCase();
-  const hit = BRANDS.find(b => t.includes(b.toLowerCase()));
-  return hit || null;
-}
-
-function findColor(text) {
-  const t = text.toLowerCase();
-  const hit = COLORS.find(c => t.includes(c));
-  return hit || null;
-}
-
-function findSize(text) {
-  // matches things like 20000mAh, 20W, 500ml, 1.5L, 12in, 3ft, 1gal, etc.
-  const re = /\b(\d{2,5}\s?(mAh|W|Wh|V|A)|\d+(\.\d+)?\s?(ml|l|oz|g|kg|mm|cm|in|ft|yd|qt|gal))\b/ig;
-  let m, best = null;
-  while ((m = re.exec(text)) !== null) {
-    const val = m[0].replace(/\s+/g,'').toLowerCase();
-    if (!best || val.length > best.length) best = val;
+function findBrand(txt) {
+  for (const b of BRAND_LIST) {
+    const re = new RegExp(`\\b${b.replace('-', '\\-')}\\b`, 'i');
+    if (re.test(txt)) return b;
   }
-  return best;
-}
-
-function findCategory(text) {
-  const t = text.toLowerCase();
-  for (const row of CATEGORY_MAP) {
-    if (row.kw.some(k => t.includes(k))) return row.category;
-  }
+  if (/\bonn\b/i.test(txt)) return 'Onn';
+  if (/\bxiomi\b/i.test(txt)) return 'Xiaomi';
   return null;
 }
 
-function guessName(text, brand, size) {
-  // take a meaningful line
-  const lines = text.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
-  let line = lines.find(l => brand && l.toLowerCase().includes(brand.toLowerCase())) || lines[0] || '';
-  line = line.replace(/\s{2,}/g,' ').trim();
+function findType(txt) {
+  if (/\bairpods?\b/i.test(txt)) return { type: 'AirPods', category: 'electronics' };
+  if (/\b(web ?cam|webcam)\b/i.test(txt)) return { type: 'Webcam', category: 'electronics' };
+  if (/\b(charger|adapter)\b/i.test(txt)) return { type: 'Charger', category: 'electronics' };
+  if (/\b(led\s*bulb|bulb)\b/i.test(txt)) return { type: 'LED Bulb', category: 'electrical' };
+  if (/\b(power\s*bank)\b/i.test(txt)) return { type: 'Power Bank', category: 'electronics' };
+  return { type: null, category: null };
+}
 
-  const parts = [];
-  if (brand) parts.push(brand);
-  const core = brand ? line.replace(new RegExp(brand, 'i'), '').trim() : line;
-  if (core) parts.push(core);
-  if (size && !parts.join(' ').toLowerCase().includes(size.toLowerCase())) parts.push(size);
-  return parts.join(' ').replace(/\s+/g,' ').trim();
+function findSize(txt) {
+  const res = (txt.match(/\b(4k|1440p|1080p|720p)\b/i) || [])[1];
+  if (res) return res.toUpperCase();
+  const watts = (txt.match(/\b(\d{1,3})\s?W\b/i) || [])[1];
+  if (watts) return `${watts}W`;
+  const mah = (txt.match(/\b(\d{3,5})\s?mAh\b/i) || [])[1];
+  if (mah) return `${mah}mAh`;
+  const abulb = (txt.match(/\bA([0-9]{2})\b/i) || [])[0];
+  if (abulb) return abulb.toUpperCase();
+  return null;
+}
+
+function refineTypeForBulbs(txt, type) {
+  if (type !== 'LED Bulb') return null;
+  const aForm = (txt.match(/\bA(19|21|60|67)\b/i) || [])[0];
+  const base = (txt.match(/\bE(26|27)\b/i) || [])[0];
+  const dimm = /\bdimmable\b/i.test(txt) ? 'Dimmable' : null;
+  const parts = [aForm, base, dimm].filter(Boolean);
+  return parts.length ? parts.join(' ') : null;
+}
+
+function buildName({ brand, type, size, txt }) {
+  let name = null;
+
+  if (/airpods/i.test(txt)) {
+    name = `${brand || 'Apple'} AirPods`;
+    if (size) name += ` ${size}`;
+    return title(name);
+  }
+
+  if (type) {
+    name = `${brand ? brand + ' ' : ''}${type}`;
+    const bulbBits = refineTypeForBulbs(txt, type);
+    if (bulbBits) name += ` ${bulbBits}`;
+    if (size) name += ` ${size}`;
+    return title(name);
+  }
+
+  const caps = (txt.match(/\b[A-Z]{3,}\b/g) || []).filter(w => !/USB|LED|CE|FCC|TM|CM/i.test(w));
+  if (brand && caps.length) name = `${brand} ${caps[0]}`;
+  else name = brand || (caps[0] ? caps[0] : 'Item');
+
+  if (size) name += ` ${size}`;
+  return title(name);
+}
+
+function scoreConfidence({ brand, type, size }) {
+  let c = 40;
+  if (brand) c += 20;
+  if (type) c += 25;
+  if (size) c += 10;
+  if (c > 98) c = 98;
+  if (c < 10) c = 10;
+  return c;
 }
 
 function extractFieldsFromText(text) {
-  const brand = findBrand(text);
-  const size = findSize(text);
-  const color = findColor(text);
-  const category = findCategory(text);
-  const name = guessName(text, brand, size);
-  const found = [brand, size, color, category].filter(Boolean).length;
-  const confidence = Math.round((found / 4) * 100);
-  return { name, brand, size, color, category, confidence, attributes: { raw: text.slice(0, 2000) } };
+  const txt = (text || '').replace(/\s+/g, ' ').trim();
+  const brand = findBrand(txt);
+  const { type, category } = findType(txt);
+  const size = findSize(txt);
+
+  const name = buildName({ brand, type, size, txt });
+  const confidence = scoreConfidence({ brand, type, size });
+
+  return {
+    name,
+    brand: brand || null,
+    category: category || null,
+    size: size || null,
+    confidence,
+    attributes: {}
+  };
 }
 
 module.exports = { extractFieldsFromText };

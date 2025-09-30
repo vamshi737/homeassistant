@@ -13,7 +13,7 @@ const { sendButtons, sendLocationList, downloadMediaById } = require('./wa');
 
 const app = express();
 app.use(express.json());
-// serve saved images
+// serve saved images publicly (for photo_url)
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 const VERIFY_TOKEN    = process.env.VERIFY_TOKEN;
@@ -199,7 +199,6 @@ async function findItems(userId, rest) {
   const freeTokens = rest.split(/\s+/).filter(t => t && !t.includes(':')).map(t => t.toLowerCase());
 
   const where = ['user_id = ?']; const params = [userId];
-
   if (args.category) { where.push('LOWER(category)=?'); params.push(args.category.toLowerCase()); }
   if (args.location) { where.push('LOWER(location)=?'); params.push(args.location.toLowerCase()); }
   if (args.brand)    { where.push('LOWER(brand)=?');    params.push(args.brand.toLowerCase()); }
@@ -224,6 +223,14 @@ async function findItems(userId, rest) {
 /* ---------- PHOTO MVP helpers ---------- */
 const pending = new Map();
 
+const DEFAULT_LOCS = (process.env.DEFAULT_LOCATIONS
+  ? process.env.DEFAULT_LOCATIONS.split(',').map(s => s.trim()).filter(Boolean)
+  : [
+      'Office/Drawer','Garage/Bin2','Workshop Drawer','Kitchen/Pantry',
+      'Bedroom/Closet','Living Room/TV Stand','Car/Glovebox','Travel Bag',
+      'Toolbox','Shed'
+    ]);
+
 async function getTopLocations(userId) {
   try {
     const rows = await all(`
@@ -232,12 +239,21 @@ async function getTopLocations(userId) {
       WHERE user_id = ? AND location IS NOT NULL AND location <> ''
       GROUP BY location
       ORDER BY c DESC
-      LIMIT 6
+      LIMIT 10
     `, [userId]);
-    const popular = rows.map(r => r.location);
-    return popular.length ? popular : ['Garage/Bin2','Office/Drawer','Travel Bag','Kitchen/Shelf','Bedroom/Closet','Car/Glovebox'];
+    const popular = rows.map(r => r.location).filter(Boolean);
+    // Return up to 9 suggestions; “Other…” will be added as the 10th row in wa.js
+    return [...new Set([...popular, ...DEFAULT_LOCS])].slice(0, 9);
   } catch {
-    return ['Garage/Bin2','Office/Drawer','Travel Bag','Kitchen/Shelf','Bedroom/Closet','Car/Glovebox'];
+    return DEFAULT_LOCS.slice(0, 9);
+  }
+}
+
+function cleanupPendingFiles(p) {
+  if (!p) return;
+  const paths = p.image_paths || (p.image_path ? [p.image_path] : []);
+  for (const f of paths) {
+    try { if (f && fs.existsSync(f)) fs.unlinkSync(f); } catch {}
   }
 }
 
@@ -277,7 +293,7 @@ async function savePendingItem(userId) {
     location || null,
     fields.brand || null,
     null,
-    photoUrl,       // now set if PUBLIC_BASE_URL is present
+    photoUrl,
     null,
     image_path || null,
     null,
@@ -286,7 +302,7 @@ async function savePendingItem(userId) {
     now
   ]);
 
-  pending.delete(userId);
+  pending.delete(userId); // keep file; we serve it via /uploads
   return fields.name || '(unknown)';
 }
 
@@ -305,38 +321,45 @@ app.post('/webhook', async (req, res) => {
     // 1) IMAGE messages
     if (msg.type === 'image' && msg.image?.id) {
       if (!canSendRealWA()) {
-        await sendText(from, '📸 I got your photo. To auto-read it and show buttons, turn off console mode and ensure WhatsApp API tokens are set.');
+        await sendText(from, '📸 Photo received. Set your WhatsApp API tokens to enable auto-read + buttons.');
         res.sendStatus(200);
         return;
       }
 
-      // delete any previous pending image for this user
-      const prev = pending.get(from);
-      if (prev?.image_path && fs.existsSync(prev.image_path)) {
-        try { fs.unlinkSync(prev.image_path); } catch {}
-      }
-
-      // 1) Download image
       const mediaId = msg.image.id;
       const buf = await downloadMediaById(mediaId);
 
-      // 2) Save locally
+      // Save locally
       const uploadsDir = path.join(__dirname, 'uploads');
       if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir);
       const filename = `${randomUUID()}.jpg`;
       const filePath = path.join(uploadsDir, filename);
       fs.writeFileSync(filePath, buf);
 
-      // 3) OCR
+      // OCR this photo
       const { text } = await ocrBuffer(buf);
 
-      // 4) Extract fields
-      const fields = extractFieldsFromText(text);
+      // Merge with any previous photo text
+      const prev = pending.get(from);
+      const mergedText = prev?.text ? `${prev.text}\n${text}` : text;
 
-      // 5) Pending state
-      pending.set(from, { fields, image_path: filePath, qty: 1, location: null });
+      // Re-extract with all text we have
+      const fields = extractFieldsFromText(mergedText);
 
-      // 6) Confirm with max-3 buttons
+      // keep state
+      const image_paths = prev?.image_paths ? [...prev.image_paths, filePath] : [filePath];
+      pending.set(from, {
+        ...(prev || {}),
+        fields,
+        text: mergedText,
+        image_paths,
+        image_path: image_paths[0],     // first photo is primary
+        qty: prev?.qty ?? 1,
+        location: prev?.location ?? null,
+        createdAt: prev?.createdAt ?? Date.now(),
+        waiting: null
+      });
+
       const bodyText =
 `Save this?
 • Name: ${fields.name || '(unknown)'}
@@ -344,17 +367,21 @@ app.post('/webhook', async (req, res) => {
 • Cat: ${fields.category || '-'} • Conf: ${fields.confidence || 0}%
 • Loc: (tap to set)`;
 
-      await sendButtons(from, bodyText, [
-        { id: 'save_item',    title: 'Save' },
-        { id: 'set_location', title: 'Set Location' },
-        { id: 'change_qty',   title: 'Set Qty' }
-      ]);
+      if (prev) {
+        await sendText(from, `🔁 Updated from another photo:\n${bodyText}`);
+      } else {
+        await sendButtons(from, bodyText, [
+          { id: 'save_item',    title: 'Save' },
+          { id: 'set_location', title: 'Set Location' },
+          { id: 'change_qty',   title: 'Set Qty' }
+        ]);
+      }
 
       res.sendStatus(200);
       return;
     }
 
-    // 2) INTERACTIVE replies
+    // 2) INTERACTIVE replies (buttons + list)
     if (msg.type === 'interactive') {
       const inter = msg.interactive;
 
@@ -369,7 +396,7 @@ app.post('/webhook', async (req, res) => {
         }
 
         if (id === 'set_location') {
-          const locs = await getTopLocations(from);
+          const locs = await getTopLocations(from); // up to 9; wa.js adds "Other…"
           if (canSendRealWA()) {
             await sendLocationList(from, locs);
           } else {
@@ -384,7 +411,7 @@ app.post('/webhook', async (req, res) => {
             await sendButtons(from, 'Choose quantity', [
               { id: 'qty_1', title: '1' },
               { id: 'qty_2', title: '2' },
-              { id: 'qty_5', title: '5' },
+              { id: 'qty_5', title: '5' }
             ]);
           } else {
             await sendText(from, 'Reply: qty_1 / qty_2 / qty_5');
@@ -404,7 +431,18 @@ app.post('/webhook', async (req, res) => {
       }
 
       if (inter.type === 'list_reply') {
+        const id = inter.list_reply.id;
         const title = inter.list_reply.title;
+
+        // Special row: free-typed location
+        if (id === 'loc_OTHER') {
+          const p = pending.get(from) || {};
+          pending.set(from, { ...p, waiting: 'custom_location' });
+          await sendText(from, '✍️ Type the location name (e.g., Kitchen/Pantry).');
+          res.sendStatus(200);
+          return;
+        }
+
         const p = pending.get(from) || {};
         pending.set(from, { ...p, location: title });
         await sendText(from, `📍 Location set: ${title}. Tap "Save" to store.`);
@@ -417,10 +455,20 @@ app.post('/webhook', async (req, res) => {
       return;
     }
 
-    // 3) TEXT commands
+    // 3) TEXT commands (and typed custom location capture)
     const text = msg?.text?.body;
     let reply = '';
     if (text) {
+      // If we are waiting for a custom location, treat this text as the location
+      const maybePending = pending.get(from);
+      if (maybePending?.waiting === 'custom_location') {
+        const loc = text.trim().slice(0, 60);
+        pending.set(from, { ...maybePending, waiting: null, location: loc });
+        await sendText(from, `📍 Location set: ${loc}. Tap "Save" to store.`);
+        res.sendStatus(200);
+        return;
+      }
+
       const { verb, rest } = splitVerb(text);
       const cmd = verb;
 
@@ -442,8 +490,10 @@ app.post('/webhook', async (req, res) => {
           `• find screw 1.5in   OR   find category:electrical brand:Philips`,
           `Tip: Use quotes for spaces → name:"A19 bulb"`,
           ``,
-          `📸 Also: send a product *photo* to add it with buttons (beta).`,
-          `Type *cancel* to abort a pending photo.`
+          `📸 From photo flow:`,
+          `   • Tap *Set Location* (picker) or choose *Other…* and then type it`,
+          `   • or send:  loc <place>`,
+          `   • finally tap *Save*`
         ].join('\n');
 
       } else if (cmd === 'add') {
@@ -487,11 +537,22 @@ app.post('/webhook', async (req, res) => {
         reply = (!a.name || !a.photo_url) ? `Usage: photo name:"<item>" url:<link>`
               : (await setPhoto(from, a.name, a.photo_url)) ? `✅ Photo saved for "${a.name}"` : `Not found: ${a.name}`;
 
+      } else if (cmd === 'loc') {
+        const place = rest.trim();
+        if (!place) {
+          reply = 'Usage: loc <place>\nExample: loc Kitchen/Pantry';
+        } else {
+          const p = pending.get(from);
+          if (!p) reply = 'No pending photo. Send a product photo first.';
+          else {
+            pending.set(from, { ...p, location: place, waiting: null });
+            reply = `📍 Location set: ${place}. Tap "Save" to store.`;
+          }
+        }
+
       } else if (cmd === 'cancel') {
         const p = pending.get(from);
-        if (p?.image_path && fs.existsSync(p.image_path)) {
-          try { fs.unlinkSync(p.image_path); } catch {}
-        }
+        cleanupPendingFiles(p);
         pending.delete(from);
         reply = '❌ Cancelled.';
 
