@@ -1,23 +1,18 @@
 // ocr.js
-const { createWorker } = require('tesseract.js');
-
-let workerPromise;
-function getWorker() {
-  if (!workerPromise) {
-    workerPromise = (async () => {
-      const worker = await createWorker();
-      await worker.loadLanguage('eng');
-      await worker.initialize('eng');
-      return worker;
-    })();
-  }
-  return workerPromise;
-}
+const Tesseract = require('tesseract.js');
 
 async function ocrBuffer(buf) {
-  const worker = await getWorker();
-  const { data } = await worker.recognize(buf);
-  return { text: data.text || '', confidence: data.confidence ?? 0 };
+  try {
+    // Simple, version-safe call
+    const { data } = await Tesseract.recognize(buf, 'eng');
+    return {
+      text: (data && data.text ? data.text : '').trim(),
+      confidence: Number.isFinite(data?.confidence) ? data.confidence : 0
+    };
+  } catch (e) {
+    console.error('OCR error:', e.message);
+    return { text: '', confidence: 0 };
+  }
 }
 
 module.exports = { ocrBuffer };
