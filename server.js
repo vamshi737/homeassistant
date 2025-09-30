@@ -4,16 +4,17 @@ const axios = require('axios');
 require('dotenv').config();
 const path = require('path');
 const fs = require('fs');
-const { v4: uuidv4 } = require('uuid');
+const { randomUUID } = require('crypto');
 
 const { init, run, get, all } = require('./db');
 const { ocrBuffer } = require('./ocr');
 const { extractFieldsFromText } = require('./extractors');
-// We will reuse YOUR sendText below, and import only what we need from wa.js:
 const { sendButtons, sendLocationList, downloadMediaById } = require('./wa');
 
 const app = express();
 app.use(express.json());
+// serve saved images
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 const VERIFY_TOKEN    = process.env.VERIFY_TOKEN;
 const WHATSAPP_TOKEN  = process.env.WHATSAPP_TOKEN;
@@ -26,16 +27,16 @@ if (!VERIFY_TOKEN || !WHATSAPP_TOKEN || !PHONE_NUMBER_ID) {
 }
 
 function canSendRealWA() {
-  if (process.env.FORCE_CONSOLE) return false; // keep console mode while test number is flaky
+  if (process.env.FORCE_CONSOLE) return false;
   return !!(PHONE_NUMBER_ID && WHATSAPP_TOKEN);
 }
 
-// YOUR existing simple text sender (kept as-is)
+// simple text sender
 async function sendText(to, message) {
   if (!canSendRealWA()) {
     console.log(`[FAKE SEND -> ${to}] ${message}`);
     return { mocked: true };
-    }
+  }
   const url = `https://graph.facebook.com/v21.0/${PHONE_NUMBER_ID}/messages`;
   return axios.post(
     url,
@@ -221,8 +222,6 @@ async function findItems(userId, rest) {
 }
 
 /* ---------- PHOTO MVP helpers ---------- */
-
-// in-memory pending item per user (until they tap Save)
 const pending = new Map();
 
 async function getTopLocations(userId) {
@@ -248,7 +247,9 @@ async function savePendingItem(userId) {
   const { fields, image_path, qty = 1, location } = p;
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
 
-  // Upsert by (user_id, name)
+  const base = process.env.PUBLIC_BASE_URL ? process.env.PUBLIC_BASE_URL.replace(/\/$/, '') : null;
+  const photoUrl = base && image_path ? `${base}/uploads/${path.basename(image_path)}` : null;
+
   await run(`
     INSERT INTO items (
       user_id, name, category, size, qty, location, brand, price, photo_url, notes,
@@ -265,6 +266,7 @@ async function savePendingItem(userId) {
       barcode=excluded.barcode,
       attributes=excluded.attributes,
       confidence=excluded.confidence,
+      photo_url=excluded.photo_url,
       updated_at=excluded.updated_at
   `, [
     userId,
@@ -274,11 +276,11 @@ async function savePendingItem(userId) {
     qty,
     location || null,
     fields.brand || null,
-    null,          // price
-    null,          // photo_url (external), not used here
-    null,          // notes
+    null,
+    photoUrl,       // now set if PUBLIC_BASE_URL is present
+    null,
     image_path || null,
-    null,          // barcode (future)
+    null,
     JSON.stringify(fields.attributes || {}),
     fields.confidence || 0,
     now
@@ -300,7 +302,7 @@ app.post('/webhook', async (req, res) => {
 
     if (!from || !msg) { res.sendStatus(200); return; }
 
-    // 1) Handle IMAGE messages (photo arrives)
+    // 1) IMAGE messages
     if (msg.type === 'image' && msg.image?.id) {
       if (!canSendRealWA()) {
         await sendText(from, '📸 I got your photo. To auto-read it and show buttons, turn off console mode and ensure WhatsApp API tokens are set.');
@@ -308,14 +310,20 @@ app.post('/webhook', async (req, res) => {
         return;
       }
 
-      // 1) Download bytes via Graph
+      // delete any previous pending image for this user
+      const prev = pending.get(from);
+      if (prev?.image_path && fs.existsSync(prev.image_path)) {
+        try { fs.unlinkSync(prev.image_path); } catch {}
+      }
+
+      // 1) Download image
       const mediaId = msg.image.id;
       const buf = await downloadMediaById(mediaId);
 
-      // 2) Save locally (URLs expire)
+      // 2) Save locally
       const uploadsDir = path.join(__dirname, 'uploads');
       if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir);
-      const filename = `${uuidv4()}.jpg`;
+      const filename = `${randomUUID()}.jpg`;
       const filePath = path.join(uploadsDir, filename);
       fs.writeFileSync(filePath, buf);
 
@@ -325,10 +333,10 @@ app.post('/webhook', async (req, res) => {
       // 4) Extract fields
       const fields = extractFieldsFromText(text);
 
-      // 5) Seed pending state for this user
+      // 5) Pending state
       pending.set(from, { fields, image_path: filePath, qty: 1, location: null });
 
-      // 6) Ask to confirm with buttons
+      // 6) Confirm with max-3 buttons
       const bodyText =
 `Save this?
 • Name: ${fields.name || '(unknown)'}
@@ -339,27 +347,19 @@ app.post('/webhook', async (req, res) => {
       await sendButtons(from, bodyText, [
         { id: 'save_item',    title: 'Save' },
         { id: 'set_location', title: 'Set Location' },
-        { id: 'change_qty',   title: 'Change Qty' },
-        { id: 'cancel',       title: 'Cancel' }
+        { id: 'change_qty',   title: 'Set Qty' }
       ]);
 
       res.sendStatus(200);
       return;
     }
 
-    // 2) Handle INTERACTIVE replies (buttons + list)
+    // 2) INTERACTIVE replies
     if (msg.type === 'interactive') {
       const inter = msg.interactive;
 
       if (inter.type === 'button_reply') {
         const id = inter.button_reply.id;
-
-        if (id === 'cancel') {
-          pending.delete(from);
-          await sendText(from, '❌ Cancelled.');
-          res.sendStatus(200);
-          return;
-        }
 
         if (id === 'save_item') {
           const savedName = await savePendingItem(from);
@@ -384,11 +384,10 @@ app.post('/webhook', async (req, res) => {
             await sendButtons(from, 'Choose quantity', [
               { id: 'qty_1', title: '1' },
               { id: 'qty_2', title: '2' },
-              { id: 'qty_3', title: '3' },
               { id: 'qty_5', title: '5' },
             ]);
           } else {
-            await sendText(from, 'Reply: qty_1 / qty_2 / qty_3 / qty_5');
+            await sendText(from, 'Reply: qty_1 / qty_2 / qty_5');
           }
           res.sendStatus(200);
           return;
@@ -405,7 +404,7 @@ app.post('/webhook', async (req, res) => {
       }
 
       if (inter.type === 'list_reply') {
-        const title = inter.list_reply.title; // selected location title
+        const title = inter.list_reply.title;
         const p = pending.get(from) || {};
         pending.set(from, { ...p, location: title });
         await sendText(from, `📍 Location set: ${title}. Tap "Save" to store.`);
@@ -413,15 +412,13 @@ app.post('/webhook', async (req, res) => {
         return;
       }
 
-      // Unknown interactive type
       await sendText(from, 'Got interactive reply.');
       res.sendStatus(200);
       return;
     }
 
-    // 3) Fallback: TEXT commands (your existing logic)
+    // 3) TEXT commands
     const text = msg?.text?.body;
-
     let reply = '';
     if (text) {
       const { verb, rest } = splitVerb(text);
@@ -445,7 +442,8 @@ app.post('/webhook', async (req, res) => {
           `• find screw 1.5in   OR   find category:electrical brand:Philips`,
           `Tip: Use quotes for spaces → name:"A19 bulb"`,
           ``,
-          `📸 Also: send a product *photo* to add it with buttons (beta).`
+          `📸 Also: send a product *photo* to add it with buttons (beta).`,
+          `Type *cancel* to abort a pending photo.`
         ].join('\n');
 
       } else if (cmd === 'add') {
@@ -488,6 +486,14 @@ app.post('/webhook', async (req, res) => {
         const a = parseKVPairs(rest);
         reply = (!a.name || !a.photo_url) ? `Usage: photo name:"<item>" url:<link>`
               : (await setPhoto(from, a.name, a.photo_url)) ? `✅ Photo saved for "${a.name}"` : `Not found: ${a.name}`;
+
+      } else if (cmd === 'cancel') {
+        const p = pending.get(from);
+        if (p?.image_path && fs.existsSync(p.image_path)) {
+          try { fs.unlinkSync(p.image_path); } catch {}
+        }
+        pending.delete(from);
+        reply = '❌ Cancelled.';
 
       } else if (cmd === 'del') {
         const a = parseKVPairs(rest);
