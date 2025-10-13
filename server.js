@@ -1,6 +1,5 @@
 // server.js
 const express = require('express');
-const axios = require('axios');
 require('dotenv').config();
 const path = require('path');
 const fs = require('fs');
@@ -9,44 +8,33 @@ const { randomUUID } = require('crypto');
 const { init, run, get, all } = require('./db');
 const { ocrBuffer } = require('./ocr');
 const { extractFieldsFromText } = require('./extractors');
-const { sendButtons, sendLocationList, downloadMediaById } = require('./wa');
+const { sendText, sendButtons, sendLocationList, downloadMediaById } = require('./wa'); // uses wa.js
 
 const app = express();
 app.use(express.json());
+
+/* ---------- DATA DIR (Render-friendly) ---------- */
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+
 // serve saved images publicly (for photo_url)
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+app.use('/uploads', express.static(UPLOADS_DIR));
 
-const VERIFY_TOKEN    = process.env.VERIFY_TOKEN;
-const WHATSAPP_TOKEN  = process.env.WHATSAPP_TOKEN;
-const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
-
-if (!VERIFY_TOKEN || !WHATSAPP_TOKEN || !PHONE_NUMBER_ID) {
-  console.warn('[WARN] Missing one or more env vars:', {
-    VERIFY_TOKEN: !!VERIFY_TOKEN, WHATSAPP_TOKEN: !!WHATSAPP_TOKEN, PHONE_NUMBER_ID: !!PHONE_NUMBER_ID
-  });
-}
+/* ---------- Config ---------- */
+const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 
 function canSendRealWA() {
   if (process.env.FORCE_CONSOLE) return false;
-  return !!(PHONE_NUMBER_ID && WHATSAPP_TOKEN);
+  return !!(process.env.PHONE_NUMBER_ID && process.env.WHATSAPP_TOKEN);
 }
 
-// simple text sender
-async function sendText(to, message) {
-  if (!canSendRealWA()) {
-    console.log(`[FAKE SEND -> ${to}] ${message}`);
-    return { mocked: true };
-  }
-  const url = `https://graph.facebook.com/v21.0/${PHONE_NUMBER_ID}/messages`;
-  return axios.post(
-    url,
-    { messaging_product: 'whatsapp', to, text: { body: message } },
-    { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' } }
-  );
-}
-
+/* ---------- Health ---------- */
 app.get('/', (req, res) => res.status(200).send('OK'));
-
+app.get('/health', (req, res) => {
+  res.json({ ok: true, uptime: process.uptime(), version: '1.0.0' });
+});
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
@@ -55,16 +43,57 @@ app.get('/webhook', (req, res) => {
   return res.sendStatus(403);
 });
 
-/* ---------- Parsing helpers ---------- */
+/* ---------- Backups (nightly + prune) ---------- */
+const BACKUP_DIR = process.env.BACKUP_DIR || path.join(DATA_DIR, 'backups');
+if (!fs.existsSync(BACKUP_DIR)) fs.mkdirSync(BACKUP_DIR, { recursive: true });
+const BACKUP_RETENTION_DAYS = parseInt(process.env.BACKUP_RETENTION_DAYS || '14', 10);
+const BACKUP_TOKEN = process.env.BACKUP_TOKEN || null;
+
+function tsStamp(d = new Date()) {
+  const pad = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+}
+async function pruneBackups() {
+  const cutoff = Date.now() - BACKUP_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+  const files = fs.readdirSync(BACKUP_DIR).filter(f => f.endsWith('.sqlite'));
+  for (const f of files) {
+    const p = path.join(BACKUP_DIR, f);
+    const st = fs.statSync(p);
+    if (st.mtimeMs < cutoff) {
+      try { fs.unlinkSync(p); } catch {}
+    }
+  }
+}
+async function performBackup() {
+  const out = path.join(BACKUP_DIR, `inventory-${tsStamp()}.sqlite`);
+  await run(`VACUUM INTO ?`, [out]);
+  await pruneBackups();
+  return out;
+}
+// Manual backup trigger: /backup-now?token=XYZ
+app.get('/backup-now', async (req, res) => {
+  try {
+    if (BACKUP_TOKEN && req.query.token !== BACKUP_TOKEN) {
+      return res.status(401).json({ ok: false, error: 'unauthorized' });
+    }
+    const file = await performBackup();
+    return res.json({ ok: true, file: `/uploads/../backups/${path.basename(file)}` });
+  } catch (e) {
+    console.error('backup error:', e.message);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+/* ---------- small helpers ---------- */
 function splitVerb(text) {
-  const t = text.trim();
+  const t = (text || '').trim();
   const space = t.indexOf(' ');
   if (space === -1) return { verb: t.toLowerCase(), rest: '' };
   return { verb: t.slice(0, space).toLowerCase(), rest: t.slice(space + 1) };
 }
 function parseKVPairs(s) {
   const args = {};
-  const re = /(\w+):"([^"]+)"|(\w+):(\S+)/g;
+  const re = /(\w+):"([^"]+)"|(\w+):([^\s]+)/g;
   let m;
   while ((m = re.exec(s))) {
     const key = (m[1] || m[3]).toLowerCase();
@@ -79,7 +108,7 @@ function parseKVPairs(s) {
   return args;
 }
 function parseNameAndInt(rest) {
-  let r = rest.trim();
+  let r = (rest || '').trim();
   if (!r) return null;
   let name = '', n = 1;
   if (r.startsWith('"')) {
@@ -97,6 +126,38 @@ function parseNameAndInt(rest) {
     if (!Number.isNaN(parsed)) n = parsed;
   }
   return { name, n };
+}
+function sanitizeText(s, limit = 120) {
+  return (s || '')
+    .replace(/[\u0000-\u001F\u007F]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, limit);
+}
+function bodyPreview(fields) {
+  const safe = {
+    name: sanitizeText(fields.name, 80) || '(unknown)',
+    brand: sanitizeText(fields.brand, 40) || '-',
+    size: sanitizeText(fields.size, 24) || '-',
+    category: sanitizeText(fields.category, 24) || '-',
+  };
+  return `Save this?
+• Name: ${safe.name}
+• Brand: ${safe.brand} • Size: ${safe.size}
+• Cat: ${safe.category} • Conf: ${fields.confidence || 0}%
+• Loc: (tap to set)`;
+}
+
+/* ---------- Rate limit (images) ---------- */
+const RATE = { maxImages: 6, windowMs: 2 * 60 * 1000 }; // 6 images / 2 min per user
+const rl = new Map(); // from -> { times: number[] }
+function hitRate(from) {
+  const now = Date.now();
+  const entry = rl.get(from) || { times: [] };
+  entry.times = entry.times.filter(t => now - t < RATE.windowMs);
+  entry.times.push(now);
+  rl.set(from, entry);
+  return entry.times.length <= RATE.maxImages;
 }
 
 /* ---------- DB helpers ---------- */
@@ -194,23 +255,22 @@ async function deleteItem(userId, name) {
   await run(`DELETE FROM items WHERE user_id=? AND LOWER(name)=LOWER(?)`, [userId, name]);
   return { name };
 }
+
+/* ---------- Search helper ---------- */
 async function findItems(userId, rest) {
   const args = parseKVPairs(rest);
   const freeTokens = rest.split(/\s+/).filter(t => t && !t.includes(':')).map(t => t.toLowerCase());
-
   const where = ['user_id = ?']; const params = [userId];
   if (args.category) { where.push('LOWER(category)=?'); params.push(args.category.toLowerCase()); }
   if (args.location) { where.push('LOWER(location)=?'); params.push(args.location.toLowerCase()); }
   if (args.brand)    { where.push('LOWER(brand)=?');    params.push(args.brand.toLowerCase()); }
   if (args.size)     { where.push('LOWER(size)=?');     params.push(args.size.toLowerCase()); }
   if (args.name)     { where.push('LOWER(name)=?');     params.push(args.name.toLowerCase()); }
-
   for (const t of freeTokens) {
     where.push(`(LOWER(name) LIKE ? OR LOWER(size) LIKE ? OR LOWER(brand) LIKE ? OR LOWER(category) LIKE ? OR LOWER(location) LIKE ?)`);
     const p = `%${t}%`;
     params.push(p, p, p, p, p);
   }
-
   const sql = `
     SELECT name, category, size, qty, location, brand, price, updated_at
     FROM items
@@ -220,7 +280,7 @@ async function findItems(userId, rest) {
   return all(sql, params);
 }
 
-/* ---------- PHOTO MVP helpers ---------- */
+/* ---------- Photo flow state ---------- */
 const pending = new Map();
 
 const DEFAULT_LOCS = (process.env.DEFAULT_LOCATIONS
@@ -242,13 +302,11 @@ async function getTopLocations(userId) {
       LIMIT 10
     `, [userId]);
     const popular = rows.map(r => r.location).filter(Boolean);
-    // Return up to 9 suggestions; “Other…” will be added as the 10th row in wa.js
     return [...new Set([...popular, ...DEFAULT_LOCS])].slice(0, 9);
   } catch {
     return DEFAULT_LOCS.slice(0, 9);
   }
 }
-
 function cleanupPendingFiles(p) {
   if (!p) return;
   const paths = p.image_paths || (p.image_path ? [p.image_path] : []);
@@ -256,16 +314,13 @@ function cleanupPendingFiles(p) {
     try { if (f && fs.existsSync(f)) fs.unlinkSync(f); } catch {}
   }
 }
-
 async function savePendingItem(userId) {
   const p = pending.get(userId);
   if (!p) return null;
   const { fields, image_path, qty = 1, location } = p;
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
-
   const base = process.env.PUBLIC_BASE_URL ? process.env.PUBLIC_BASE_URL.replace(/\/$/, '') : null;
   const photoUrl = base && image_path ? `${base}/uploads/${path.basename(image_path)}` : null;
-
   await run(`
     INSERT INTO items (
       user_id, name, category, size, qty, location, brand, price, photo_url, notes,
@@ -301,8 +356,7 @@ async function savePendingItem(userId) {
     fields.confidence || 0,
     now
   ]);
-
-  pending.delete(userId); // keep file; we serve it via /uploads
+  pending.delete(userId);
   return fields.name || '(unknown)';
 }
 
@@ -318,32 +372,48 @@ app.post('/webhook', async (req, res) => {
 
     if (!from || !msg) { res.sendStatus(200); return; }
 
-    // 1) IMAGE messages
+    /* ----- 1) IMAGE ----- */
     if (msg.type === 'image' && msg.image?.id) {
       if (!canSendRealWA()) {
         await sendText(from, '📸 Photo received. Set your WhatsApp API tokens to enable auto-read + buttons.');
-        res.sendStatus(200);
-        return;
+        res.sendStatus(200); return;
+      }
+
+      // rate limit
+      if (!hitRate(from)) {
+        await sendText(from, '⏳ You are sending photos too fast. Please wait a moment and try again.');
+        res.sendStatus(200); return;
+      }
+
+      // mime validation (client-reported)
+      const mime = msg.image?.mime_type || '';
+      if (!/^image\/(jpe?g|png|webp)$/i.test(mime)) {
+        await sendText(from, '⚠️ Please send a JPG/PNG/WEBP image.');
+        res.sendStatus(200); return;
       }
 
       const mediaId = msg.image.id;
       const buf = await downloadMediaById(mediaId);
 
+      // size validation
+      if (buf.length > 10 * 1024 * 1024) { // 10MB
+        await sendText(from, '⚠️ Image is too large (max 10MB). Please send a smaller one.');
+        res.sendStatus(200); return;
+      }
+
       // Save locally
-      const uploadsDir = path.join(__dirname, 'uploads');
-      if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir);
       const filename = `${randomUUID()}.jpg`;
-      const filePath = path.join(uploadsDir, filename);
+      const filePath = path.join(UPLOADS_DIR, filename);
       fs.writeFileSync(filePath, buf);
 
       // OCR this photo
       const { text } = await ocrBuffer(buf);
 
-      // Merge with any previous photo text
+      // Merge with any previous photo text for this *pending* item
       const prev = pending.get(from);
       const mergedText = prev?.text ? `${prev.text}\n${text}` : text;
 
-      // Re-extract with all text we have
+      // Extract fields from merged text
       const fields = extractFieldsFromText(mergedText);
 
       // keep state
@@ -360,20 +430,15 @@ app.post('/webhook', async (req, res) => {
         waiting: null
       });
 
-      const bodyText =
-`Save this?
-• Name: ${fields.name || '(unknown)'}
-• Brand: ${fields.brand || '-'} • Size: ${fields.size || '-'}
-• Cat: ${fields.category || '-'} • Conf: ${fields.confidence || 0}%
-• Loc: (tap to set)`;
+      const bodyText = bodyPreview(fields);
 
       if (prev) {
         await sendText(from, `🔁 Updated from another photo:\n${bodyText}`);
       } else {
         await sendButtons(from, bodyText, [
           { id: 'save_item',    title: 'Save' },
-          { id: 'set_location', title: 'Set Location' },
-          { id: 'change_qty',   title: 'Set Qty' }
+          { id: 'edit_item',    title: 'Edit' },
+          { id: 'set_location', title: 'Set Location' }
         ]);
       }
 
@@ -381,7 +446,7 @@ app.post('/webhook', async (req, res) => {
       return;
     }
 
-    // 2) INTERACTIVE replies (buttons + list)
+    /* ----- 2) INTERACTIVE (buttons + list) ----- */
     if (msg.type === 'interactive') {
       const inter = msg.interactive;
 
@@ -391,91 +456,135 @@ app.post('/webhook', async (req, res) => {
         if (id === 'save_item') {
           const savedName = await savePendingItem(from);
           await sendText(from, `✅ Saved: ${savedName}`);
-          res.sendStatus(200);
-          return;
+          res.sendStatus(200); return;
+        }
+
+        if (id === 'edit_item') {
+          const p = pending.get(from);
+          if (!p) {
+            await sendText(from, 'No pending item. Send a photo first.');
+          } else {
+            await sendText(from,
+`✍️ Edit fields, then tap *Save*:
+• edit_name <new name>
+• edit_brand <brand>
+• edit_size <size or count>
+• edit_cat <category>
+• edit_qty <number>
+
+Current:
+- name: ${p.fields?.name || '(unknown)'}
+- brand: ${p.fields?.brand || '-'}
+- size: ${p.fields?.size || '-'}
+- cat: ${p.fields?.category || '-'}
+- qty: ${p.qty ?? 1}`);
+          }
+          res.sendStatus(200); return;
         }
 
         if (id === 'set_location') {
-          const locs = await getTopLocations(from); // up to 9; wa.js adds "Other…"
-          if (canSendRealWA()) {
-            await sendLocationList(from, locs);
-          } else {
-            await sendText(from, `Pick a location: ${locs.join(' | ')}`);
-          }
-          res.sendStatus(200);
-          return;
+          const locs = await getTopLocations(from);
+          if (canSendRealWA()) await sendLocationList(from, locs);
+          else await sendText(from, `Pick a location: ${locs.join(' | ')}`);
+          res.sendStatus(200); return;
         }
 
-        if (id === 'change_qty') {
-          if (canSendRealWA()) {
-            await sendButtons(from, 'Choose quantity', [
-              { id: 'qty_1', title: '1' },
-              { id: 'qty_2', title: '2' },
-              { id: 'qty_5', title: '5' }
-            ]);
-          } else {
-            await sendText(from, 'Reply: qty_1 / qty_2 / qty_5');
-          }
-          res.sendStatus(200);
-          return;
+        // delete confirmations
+        if (id.startsWith('confirm_del:')) {
+          const nm = id.split(':').slice(1).join(':');
+          const ok = await deleteItem(from, nm);
+          await sendText(from, ok ? `🗑️ Deleted "${nm}"` : `Not found: ${nm}`);
+          res.sendStatus(200); return;
         }
-
-        if (id.startsWith('qty_')) {
-          const qty = parseInt(id.split('_')[1], 10) || 1;
-          const p = pending.get(from) || {};
-          pending.set(from, { ...p, qty });
-          await sendText(from, `✔️ Quantity set to ${qty}. Tap "Save" when ready.`);
-          res.sendStatus(200);
-          return;
+        if (id.startsWith('cancel_del:')) {
+          const nm = id.split(':').slice(1).join(':');
+          await sendText(from, `Cancelled deleting "${nm}".`);
+          res.sendStatus(200); return;
         }
       }
 
       if (inter.type === 'list_reply') {
-        const id = inter.list_reply.id;
+        const selId = inter.list_reply.id;
         const title = inter.list_reply.title;
-
-        // Special row: free-typed location
-        if (id === 'loc_OTHER') {
+        if (selId === 'loc_OTHER') {
           const p = pending.get(from) || {};
           pending.set(from, { ...p, waiting: 'custom_location' });
           await sendText(from, '✍️ Type the location name (e.g., Kitchen/Pantry).');
-          res.sendStatus(200);
-          return;
+          res.sendStatus(200); return;
         }
-
         const p = pending.get(from) || {};
         pending.set(from, { ...p, location: title });
         await sendText(from, `📍 Location set: ${title}. Tap "Save" to store.`);
-        res.sendStatus(200);
-        return;
+        res.sendStatus(200); return;
       }
 
+      // fallback
       await sendText(from, 'Got interactive reply.');
       res.sendStatus(200);
       return;
     }
 
-    // 3) TEXT commands (and typed custom location capture)
-    const text = msg?.text?.body;
+    /* ----- 3) TEXT (commands + edit/custom-location capture) ----- */
+    const text = msg?.text?.body || '';
     let reply = '';
-    if (text) {
-      // If we are waiting for a custom location, treat this text as the location
-      const maybePending = pending.get(from);
-      if (maybePending?.waiting === 'custom_location') {
-        const loc = text.trim().slice(0, 60);
-        pending.set(from, { ...maybePending, waiting: null, location: loc });
-        await sendText(from, `📍 Location set: ${loc}. Tap "Save" to store.`);
-        res.sendStatus(200);
-        return;
-      }
 
-      const { verb, rest } = splitVerb(text);
+    // capture custom location
+    const maybePending = pending.get(from);
+    if (maybePending?.waiting === 'custom_location') {
+      const loc = text.trim().slice(0, 60);
+      pending.set(from, { ...maybePending, waiting: null, location: loc });
+      await sendText(from, `📍 Location set: ${loc}. Tap "Save" to store.`);
+      res.sendStatus(200); return;
+    }
+
+    // edit_* commands for pending photo
+    const { verb, rest } = splitVerb(text);
+    if (verb.startsWith('edit_')) {
+      const p = pending.get(from);
+      if (!p) {
+        reply = 'No pending item to edit. Send a photo first.';
+      } else {
+        const value = rest.trim().slice(0, 80);
+        if (!value) {
+          reply = `Usage: ${verb} <value>`;
+        } else {
+          const f = { ...(p.fields || {}) };
+          if (verb === 'edit_name')  f.name = value;
+          else if (verb === 'edit_brand') f.brand = value;
+          else if (verb === 'edit_size')  f.size = value;
+          else if (verb === 'edit_cat')   f.category = value;
+          else if (verb === 'edit_qty')   { 
+            const q = Math.max(0, parseInt(value, 10) || 0);
+            pending.set(from, { ...p, qty: q });
+            await sendButtons(from, bodyPreview({ ...f, confidence: f.confidence || 70 }), [
+              { id: 'save_item',    title: 'Save' },
+              { id: 'edit_item',    title: 'Edit' },
+              { id: 'set_location', title: 'Set Location' }
+            ]);
+            res.sendStatus(200); return;
+          }
+          f.confidence = f.confidence || 70;
+          pending.set(from, { ...p, fields: f });
+          await sendButtons(from, bodyPreview(f), [
+            { id: 'save_item',    title: 'Save' },
+            { id: 'edit_item',    title: 'Edit' },
+            { id: 'set_location', title: 'Set Location' }
+          ]);
+          res.sendStatus(200); return;
+        }
+      }
+      await sendText(from, reply);
+      res.sendStatus(200); return;
+    }
+
+    // normal commands
+    if (text) {
       const cmd = verb;
 
       if (cmd === 'hi' || cmd === 'hello') {
-        reply = name
+        reply = (name
           ? `Hello ${name}! 👋 Welcome to Home Assistant Bot.\nType "help" anytime.`
-          : `Hello! 👋 Welcome to Home Assistant Bot.\nType "help" anytime.`;
+          : `Hello! 👋 Welcome to Home Assistant Bot.\nType "help" anytime.`);
 
       } else if (cmd === 'help') {
         reply = [
@@ -488,12 +597,9 @@ app.post('/webhook', async (req, res) => {
           `• photo name:"ac_filter" url:https://link`,
           `• del name:"ac_filter"`,
           `• find screw 1.5in   OR   find category:electrical brand:Philips`,
-          `Tip: Use quotes for spaces → name:"A19 bulb"`,
           ``,
-          `📸 From photo flow:`,
-          `   • Tap *Set Location* (picker) or choose *Other…* and then type it`,
-          `   • or send:  loc <place>`,
-          `   • finally tap *Save*`
+          `📸 Photo flow: tap *Edit* to tweak, *Set Location*, then *Save*.`,
+          `   Or send: edit_name ..., edit_brand ..., edit_size ..., edit_cat ..., edit_qty ...`
         ].join('\n');
 
       } else if (cmd === 'add') {
@@ -528,7 +634,7 @@ app.post('/webhook', async (req, res) => {
       } else if (cmd === 'move') {
         const a = parseKVPairs(rest);
         const nm = a.name || (rest.match(/^"([^"]+)"/)?.[1]) || rest.split(/\s+/)[0];
-        const loc = a.location;
+        const loc = a.location || a.loc;
         reply = (!nm || !loc) ? `Usage: move name:"<item>" loc:"<new location>"`
               : (await moveItem(from, nm, loc)) ? `✅ Moved "${nm}" to 📍 ${loc}` : `Not found: ${nm}`;
 
@@ -545,7 +651,7 @@ app.post('/webhook', async (req, res) => {
           const p = pending.get(from);
           if (!p) reply = 'No pending photo. Send a product photo first.';
           else {
-            pending.set(from, { ...p, location: place, waiting: null });
+            pending.set(from, { ...p, location: place });
             reply = `📍 Location set: ${place}. Tap "Save" to store.`;
           }
         }
@@ -559,8 +665,15 @@ app.post('/webhook', async (req, res) => {
       } else if (cmd === 'del') {
         const a = parseKVPairs(rest);
         const nm = a.name || rest.trim().replace(/^"|"$/g, '');
-        reply = !nm ? `Usage: del name:"<item>"`
-              : (await deleteItem(from, nm)) ? `🗑️ Deleted "${nm}"` : `Not found: ${nm}`;
+        if (!nm) {
+          reply = 'Usage: del name:"<item>"';
+        } else {
+          await sendButtons(from, `Delete "${nm}"? This cannot be undone.`, [
+            { id: `confirm_del:${nm}`, title: 'Yes, delete' },
+            { id: `cancel_del:${nm}`,  title: 'Cancel' }
+          ]);
+          reply = ''; // already sent buttons
+        }
 
       } else if (cmd === 'find') {
         reply = formatList(await findItems(from, rest));
@@ -572,7 +685,7 @@ app.post('/webhook', async (req, res) => {
       reply = `I received your message 👍 (non-text). Try sending a text like "hi" or "help".`;
     }
 
-    await sendText(from, reply);
+    if (reply) await sendText(from, reply);
     res.sendStatus(200);
 
   } catch (e) {

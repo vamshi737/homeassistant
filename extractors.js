@@ -1,96 +1,143 @@
 // extractors.js
-function cap(s) { return s ? s[0].toUpperCase() + s.slice(1).toLowerCase() : s; }
-function title(s) { return s.replace(/\s+/g,' ').trim().split(' ').map(cap).join(' '); }
 
+function titleCase(s) {
+  return (s || '').toLowerCase().replace(/\s+/g, ' ').trim().replace(/\b\w/g, c => c.toUpperCase());
+}
+function clean(s) { return (s || '').replace(/\s+/g, ' ').trim(); }
+function norm(s) { return (s || '').toLowerCase(); }
+
+// Common brands (incl. store brands)
 const BRAND_LIST = [
-  'Apple','Onn','Mi','Xiaomi','Philips','Belkin','Anker','Logitech','Samsung','Sony',
-  'Meridian','Boat','JBL','Google','Razer','HP','Dell','Lenovo','Acer','Asus','Amazon',
-  'TP-Link','Netgear','Realme','OnePlus'
+  'Apple','Onn','Anker','Belkin','Philips','Logitech','Samsung','Sony','Mi','Xiaomi',
+  'JBL','Boat','Meridian','Google','Razer','HP','Dell','Lenovo','Acer','Asus','Amazon',
+  'TP-Link','Netgear','Realme','OnePlus','Duracell','Energizer','Kirkland','Great Value',
+  "Member's Mark","Members Mark","Member S Mark","Equate","Ugreen","Baseus","Aukey",
+  'Luxreve','LUXREVE'
 ];
 
 function findBrand(txt) {
-  for (const b of BRAND_LIST) {
-    const re = new RegExp(`\\b${b.replace('-', '\\-')}\\b`, 'i');
-    if (re.test(txt)) return b;
+  const t = norm(txt);
+  // variants first
+  if (/\bmember'?s?\s+mark\b/.test(t)) return "Member's Mark";
+  if (/\bkirkland\b/.test(t)) return 'Kirkland';
+  if (/\bgreat\s+value\b/.test(t)) return 'Great Value';
+  if (/\bonn\b/.test(t)) return 'Onn';
+  if (/\bxiomi\b/.test(t)) return 'Xiaomi'; // misspelling
+
+  for (const raw of BRAND_LIST) {
+    const b = norm(raw);
+    const re = new RegExp(`\\b${b.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&')}\\b`, 'i');
+    if (re.test(txt)) return raw.replace(/Members Mark|Member S Mark/i, "Member's Mark");
   }
-  if (/\bonn\b/i.test(txt)) return 'Onn';
-  if (/\bxiomi\b/i.test(txt)) return 'Xiaomi';
+
+  // Heuristic: first ALLCAPS-ish logo line
+  const line = (txt.split('\n')
+    .map(l => l.trim())
+    .find(l => /^[A-Z][A-Z0-9 '&.-]{3,}$/.test(l)) || '').trim();
+  return line ? titleCase(line.split(/\s{2,}|\s-\s/)[0]) : null;
+}
+
+function findCountOrSize(txt) {
+  const t = norm(txt);
+
+  // Counts: 204 ct / 200 count / 20 pcs / 4 pack / 3-pack
+  const mCt = t.match(/\b(\d{1,4})\s*(ct|count|pcs?|pack)\b|(\d{1,4})-pack\b/);
+  if (mCt) {
+    const n = mCt[1] || mCt[3];
+    return `${n}ct`;
+  }
+
+  // Power/capacity/resolution only in sensible contexts
+  const likelyPowerCtx = /(bulb|led|lamp|watt|charger|adapter|power|usb)/.test(t);
+
+  const mW = likelyPowerCtx ? t.match(/\b(\d{1,3})\s*w(?:att)?s?\b/) : null;
+  if (mW) return `${mW[1]}W`;
+
+  const mMah = t.match(/\b(\d{3,5})\s*mAh\b/i);
+  if (mMah) return `${mMah[1]}mAh`;
+
+  const mRes = t.match(/\b(4k|1440p|1080p|720p)\b/i);
+  if (mRes) return mRes[1].toUpperCase();
+
+  // Bulb forms/bases
+  const mA = t.match(/\bA(19|21|60|67)\b/);
+  if (mA) return `A${mA[1]}`;
+  const mBase = t.match(/\bE(26|27)\b/);
+  if (mBase) return `E${mBase[1]}`;
+
   return null;
 }
 
-function findType(txt) {
-  if (/\bairpods?\b/i.test(txt)) return { type: 'AirPods', category: 'electronics' };
-  if (/\b(web ?cam|webcam)\b/i.test(txt)) return { type: 'Webcam', category: 'electronics' };
-  if (/\b(charger|adapter)\b/i.test(txt)) return { type: 'Charger', category: 'electronics' };
-  if (/\b(led\s*bulb|bulb)\b/i.test(txt)) return { type: 'LED Bulb', category: 'electrical' };
-  if (/\b(power\s*bank)\b/i.test(txt)) return { type: 'Power Bank', category: 'electronics' };
-  return { type: null, category: null };
-}
-
-function findSize(txt) {
-  const res = (txt.match(/\b(4k|1440p|1080p|720p)\b/i) || [])[1];
-  if (res) return res.toUpperCase();
-  const watts = (txt.match(/\b(\d{1,3})\s?W\b/i) || [])[1];
-  if (watts) return `${watts}W`;
-  const mah = (txt.match(/\b(\d{3,5})\s?mAh\b/i) || [])[1];
-  if (mah) return `${mah}mAh`;
-  const abulb = (txt.match(/\bA([0-9]{2})\b/i) || [])[0];
-  if (abulb) return abulb.toUpperCase();
+function findCategory(txt) {
+  const t = norm(txt);
+  if (/(paper\s*plates?|napkins?|tissues?|paper\s*towels?)/.test(t)) return 'household';
+  if (/(bulb|led\s*bulb|lamp)/.test(t)) return 'electrical';
+  if (/(web\s?cam|webcam|camera)/.test(t)) return 'electronics';
+  if (/(charger|adapter|usb[- ]?c|power\s*(brick|adapter))/ .test(t)) return 'electronics';
+  if (/(power\s*bank|battery\s*pack)/.test(t)) return 'electronics';
+  if (/\bairpods?\b/.test(t)) return 'electronics';
+  if (/(watch\s*(case|roll)|watch\s*travel\s*pouch)/.test(t)) return 'storage';
   return null;
 }
 
-function refineTypeForBulbs(txt, type) {
-  if (type !== 'LED Bulb') return null;
-  const aForm = (txt.match(/\bA(19|21|60|67)\b/i) || [])[0];
-  const base = (txt.match(/\bE(26|27)\b/i) || [])[0];
-  const dimm = /\bdimmable\b/i.test(txt) ? 'Dimmable' : null;
-  const parts = [aForm, base, dimm].filter(Boolean);
-  return parts.length ? parts.join(' ') : null;
+function findProductNoun(txt) {
+  const t = norm(txt);
+  if (/(paper\s*plates?|plates)/.test(t)) return 'Paper Plates';
+  if (/\bairpods?\b/.test(t)) return 'AirPods';
+  if (/(web\s?cam|webcam)/.test(t)) return 'Webcam';
+  if (/(power\s*bank)/.test(t)) return 'Power Bank';
+  if (/(usb[- ]?c\s*charger|charger|adapter)/.test(t)) return 'Charger';
+  if (/(led\s*bulb|bulb)/.test(t)) return 'LED Bulb';
+  if (/(watch\s*(case|roll)|watch\s*travel\s*pouch)/.test(t)) return 'Watch Case';
+  return null;
 }
 
-function buildName({ brand, type, size, txt }) {
-  let name = null;
+function refineBulbBits(txt) {
+  const t = norm(txt);
+  const a = (t.match(/\bA(19|21|60|67)\b/i) || [])[0];
+  const e = (t.match(/\bE(26|27)\b/i) || [])[0];
+  const dim = /\bdimmable\b/i.test(t) ? 'Dimmable' : null;
+  return [a, e, dim].filter(Boolean).join(' ');
+}
 
-  if (/airpods/i.test(txt)) {
-    name = `${brand || 'Apple'} AirPods`;
-    if (size) name += ` ${size}`;
-    return title(name);
+function buildName({ brand, noun, size, txt }) {
+  let name;
+  if (noun) {
+    name = `${brand ? brand + ' ' : ''}${noun}`;
+    if (noun === 'LED Bulb') {
+      const bits = refineBulbBits(txt);
+      if (bits) name += ` ${bits}`;
+    }
+  } else {
+    // Fallback: first decent caps token (avoid common labels)
+    const caps = (txt.match(/\b[A-Z][A-Z0-9'-]{2,}\b/g) || [])
+      .filter(w => !/USB|LED|CE|FCC|TM|CM|UL|ETL|CT|OZ|ML/i.test(w));
+    name = brand ? `${brand}${caps[0] ? ' ' + caps[0] : ''}` : (caps[0] || 'Item');
   }
-
-  if (type) {
-    name = `${brand ? brand + ' ' : ''}${type}`;
-    const bulbBits = refineTypeForBulbs(txt, type);
-    if (bulbBits) name += ` ${bulbBits}`;
-    if (size) name += ` ${size}`;
-    return title(name);
-  }
-
-  const caps = (txt.match(/\b[A-Z]{3,}\b/g) || []).filter(w => !/USB|LED|CE|FCC|TM|CM/i.test(w));
-  if (brand && caps.length) name = `${brand} ${caps[0]}`;
-  else name = brand || (caps[0] ? caps[0] : 'Item');
-
   if (size) name += ` ${size}`;
-  return title(name);
+  return titleCase(clean(name));
 }
 
-function scoreConfidence({ brand, type, size }) {
-  let c = 40;
+function scoreConfidence({ brand, noun, size }) {
+  let c = 50;
   if (brand) c += 20;
-  if (type) c += 25;
-  if (size) c += 10;
+  if (noun)  c += 20;
+  if (size)  c += 8;
   if (c > 98) c = 98;
-  if (c < 10) c = 10;
+  if (c < 20) c = 20;
   return c;
 }
 
 function extractFieldsFromText(text) {
-  const txt = (text || '').replace(/\s+/g, ' ').trim();
-  const brand = findBrand(txt);
-  const { type, category } = findType(txt);
-  const size = findSize(txt);
+  const txt = clean(text || '');
 
-  const name = buildName({ brand, type, size, txt });
-  const confidence = scoreConfidence({ brand, type, size });
+  const brand = findBrand(txt);
+  const noun  = findProductNoun(txt);
+  const size  = findCountOrSize(txt);
+  const category = findCategory(txt);
+
+  const name = buildName({ brand, noun, size, txt });
+  const confidence = scoreConfidence({ brand, noun, size });
 
   return {
     name,
@@ -98,7 +145,7 @@ function extractFieldsFromText(text) {
     category: category || null,
     size: size || null,
     confidence,
-    attributes: {}
+    attributes: { noun } // helpful for comparisons
   };
 }
 
