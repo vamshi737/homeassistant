@@ -1,4 +1,4 @@
-// wa.js
+// wa.js (UNCHANGED)
 const axios = require('axios');
 
 const GRAPH = 'https://graph.facebook.com/v21.0';
@@ -21,7 +21,6 @@ async function sendText(to, text) {
 }
 
 async function sendButtons(to, bodyText, buttons) {
-  // WhatsApp limit: max 3 buttons
   return waPost(`${PHONE_NUMBER_ID}/messages`, {
     messaging_product: 'whatsapp',
     to,
@@ -40,11 +39,7 @@ async function sendButtons(to, bodyText, buttons) {
 }
 
 async function sendLocationList(to, locations) {
-  // show up to 9 suggestions; we add “Other… (type it)” as the 10th row
-  const rows = locations.slice(0, 9).map((loc, i) => ({
-    id: `loc_${i}_${loc}`,
-    title: loc
-  }));
+  const rows = locations.slice(0, 9).map((loc, i) => ({ id: `loc_${i}_${loc}`, title: loc }));
   rows.push({ id: 'loc_OTHER', title: 'Other… (type it)' });
 
   return waPost(`${PHONE_NUMBER_ID}/messages`, {
@@ -60,12 +55,10 @@ async function sendLocationList(to, locations) {
 }
 
 async function downloadMediaById(mediaId) {
-  // 1) temporary URL
   const meta = await axios.get(`${GRAPH}/${mediaId}`, {
     headers: { Authorization: `Bearer ${WA_TOKEN}` }
   });
   const url = meta.data.url;
-  // 2) bytes
   const img = await axios.get(url, {
     headers: { Authorization: `Bearer ${WA_TOKEN}` },
     responseType: 'arraybuffer'
