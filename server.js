@@ -13,6 +13,7 @@ const { sendButtons, sendLocationList, downloadMediaById } = require('./wa');
 
 const app = express();
 app.use(express.json());
+
 // serve saved images publicly (for photo_url)
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
@@ -31,7 +32,7 @@ function canSendRealWA() {
   return !!(PHONE_NUMBER_ID && WHATSAPP_TOKEN);
 }
 
-// simple text sender
+// simple text sender (used in addition to wa.js helpers)
 async function sendText(to, message) {
   if (!canSendRealWA()) {
     console.log(`[FAKE SEND -> ${to}] ${message}`);
@@ -46,7 +47,6 @@ async function sendText(to, message) {
 }
 
 app.get('/', (req, res) => res.status(200).send('OK'));
-
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
@@ -55,9 +55,9 @@ app.get('/webhook', (req, res) => {
   return res.sendStatus(403);
 });
 
-/* ---------- Parsing helpers ---------- */
+/* ---------- helpers ---------- */
 function splitVerb(text) {
-  const t = text.trim();
+  const t = (text || '').trim();
   const space = t.indexOf(' ');
   if (space === -1) return { verb: t.toLowerCase(), rest: '' };
   return { verb: t.slice(0, space).toLowerCase(), rest: t.slice(space + 1) };
@@ -79,7 +79,7 @@ function parseKVPairs(s) {
   return args;
 }
 function parseNameAndInt(rest) {
-  let r = rest.trim();
+  let r = (rest || '').trim();
   if (!r) return null;
   let name = '', n = 1;
   if (r.startsWith('"')) {
@@ -97,6 +97,16 @@ function parseNameAndInt(rest) {
     if (!Number.isNaN(parsed)) n = parsed;
   }
   return { name, n };
+}
+function sanitize(s, limit = 120) {
+  return (s || '').replace(/[\u0000-\u001F\u007F]/g, '').replace(/\s+/g, ' ').trim().slice(0, limit);
+}
+function previewBody(fields) {
+  return `Save this?
+• Name: ${sanitize(fields.name, 80) || '(unknown)'}
+• Brand: ${sanitize(fields.brand, 40) || '-'} • Size: ${sanitize(fields.size, 24) || '-'}
+• Cat: ${sanitize(fields.category, 24) || '-'} • Conf: ${fields.confidence || 0}%
+• Loc: (tap to set)`;
 }
 
 /* ---------- DB helpers ---------- */
@@ -142,8 +152,8 @@ function formatItem(i) {
 }
 async function listItems(userId, filters = {}) {
   const where = ['user_id = ?']; const params = [userId];
-  if (filters.category) { where.push('LOWER(category)=?'); params.push(filters.category.toLowerCase()); }
-  if (filters.location) { where.push('LOWER(location)=?'); params.push(filters.location.toLowerCase()); }
+  if (filters.category) { where.push('LOWER(category)=?'); params.push((filters.category || '').toLowerCase()); }
+  if (filters.location) { where.push('LOWER(location)=?'); params.push((filters.location || '').toLowerCase()); }
   const sql = `
     SELECT name, category, size, qty, location, brand, price, updated_at
     FROM items
@@ -220,7 +230,7 @@ async function findItems(userId, rest) {
   return all(sql, params);
 }
 
-/* ---------- PHOTO MVP helpers ---------- */
+/* ---------- PHOTO MVP state ---------- */
 const pending = new Map();
 
 const DEFAULT_LOCS = (process.env.DEFAULT_LOCATIONS
@@ -242,7 +252,6 @@ async function getTopLocations(userId) {
       LIMIT 10
     `, [userId]);
     const popular = rows.map(r => r.location).filter(Boolean);
-    // Return up to 9 suggestions; “Other…” will be added as the 10th row in wa.js
     return [...new Set([...popular, ...DEFAULT_LOCS])].slice(0, 9);
   } catch {
     return DEFAULT_LOCS.slice(0, 9);
@@ -338,6 +347,7 @@ app.post('/webhook', async (req, res) => {
 
       // OCR this photo
       const { text } = await ocrBuffer(buf);
+      console.log('[OCR length]', (text || '').length, (text || '').slice(0, 300));
 
       // Merge with any previous photo text
       const prev = pending.get(from);
@@ -360,22 +370,14 @@ app.post('/webhook', async (req, res) => {
         waiting: null
       });
 
-      const bodyText =
-`Save this?
-• Name: ${fields.name || '(unknown)'}
-• Brand: ${fields.brand || '-'} • Size: ${fields.size || '-'}
-• Cat: ${fields.category || '-'} • Conf: ${fields.confidence || 0}%
-• Loc: (tap to set)`;
+      const bodyText = previewBody(fields);
 
-      if (prev) {
-        await sendText(from, `🔁 Updated from another photo:\n${bodyText}`);
-      } else {
-        await sendButtons(from, bodyText, [
-          { id: 'save_item',    title: 'Save' },
-          { id: 'set_location', title: 'Set Location' },
-          { id: 'change_qty',   title: 'Set Qty' }
-        ]);
-      }
+      // Always show buttons so user can Save/Edit/Set Location immediately
+      await sendButtons(from, bodyText, [
+        { id: 'save_item',    title: 'Save' },
+        { id: 'edit_item',    title: 'Edit' },
+        { id: 'set_location', title: 'Set Location' }
+      ]);
 
       res.sendStatus(200);
       return;
@@ -395,6 +397,31 @@ app.post('/webhook', async (req, res) => {
           return;
         }
 
+        if (id === 'edit_item') {
+          const p = pending.get(from);
+          if (!p) {
+            await sendText(from, 'No pending item. Send a photo first.');
+          } else {
+            pending.set(from, { ...p, waiting: 'edit' });
+            await sendText(from,
+`✍️ Edit fields, then tap *Save*:
+• edit_name <new name>
+• edit_brand <brand>
+• edit_size <size or count>
+• edit_cat <category>
+• edit_qty <number>
+
+Current:
+- name: ${p.fields?.name || '(unknown)'}
+- brand: ${p.fields?.brand || '-'}
+- size: ${p.fields?.size || '-'}
+- cat: ${p.fields?.category || '-'}
+- qty: ${p.qty ?? 1}`);
+          }
+          res.sendStatus(200);
+          return;
+        }
+
         if (id === 'set_location') {
           const locs = await getTopLocations(from); // up to 9; wa.js adds "Other…"
           if (canSendRealWA()) {
@@ -402,29 +429,6 @@ app.post('/webhook', async (req, res) => {
           } else {
             await sendText(from, `Pick a location: ${locs.join(' | ')}`);
           }
-          res.sendStatus(200);
-          return;
-        }
-
-        if (id === 'change_qty') {
-          if (canSendRealWA()) {
-            await sendButtons(from, 'Choose quantity', [
-              { id: 'qty_1', title: '1' },
-              { id: 'qty_2', title: '2' },
-              { id: 'qty_5', title: '5' }
-            ]);
-          } else {
-            await sendText(from, 'Reply: qty_1 / qty_2 / qty_5');
-          }
-          res.sendStatus(200);
-          return;
-        }
-
-        if (id.startsWith('qty_')) {
-          const qty = parseInt(id.split('_')[1], 10) || 1;
-          const p = pending.get(from) || {};
-          pending.set(from, { ...p, qty });
-          await sendText(from, `✔️ Quantity set to ${qty}. Tap "Save" when ready.`);
           res.sendStatus(200);
           return;
         }
@@ -455,12 +459,13 @@ app.post('/webhook', async (req, res) => {
       return;
     }
 
-    // 3) TEXT commands (and typed custom location capture)
+    // 3) TEXT commands (and typed custom location capture + edit_* commands)
     const text = msg?.text?.body;
     let reply = '';
     if (text) {
       // If we are waiting for a custom location, treat this text as the location
       const maybePending = pending.get(from);
+
       if (maybePending?.waiting === 'custom_location') {
         const loc = text.trim().slice(0, 60);
         pending.set(from, { ...maybePending, waiting: null, location: loc });
@@ -469,7 +474,42 @@ app.post('/webhook', async (req, res) => {
         return;
       }
 
+      // --- edit_* commands for current pending item ---
       const { verb, rest } = splitVerb(text);
+      if (verb.startsWith('edit_')) {
+        const p = pending.get(from);
+        if (!p) {
+          await sendText(from, 'No pending item to edit. Send a photo first.');
+          res.sendStatus(200); return;
+        }
+
+        const f = { ...(p.fields || {}) };
+        const value = (rest || '').trim().slice(0, 80);
+
+        if (!value && verb !== 'edit_qty') {
+          await sendText(from, `Usage: ${verb} <value>`);
+          res.sendStatus(200); return;
+        }
+
+        if (verb === 'edit_name')  f.name = value;
+        if (verb === 'edit_brand') f.brand = value;
+        if (verb === 'edit_size')  f.size = value;
+        if (verb === 'edit_cat')   f.category = value;
+        if (verb === 'edit_qty')   p.qty = Math.max(0, parseInt(value, 10) || 0);
+
+        f.confidence = f.confidence || 70;
+        pending.set(from, { ...p, fields: f });
+
+        await sendButtons(from, previewBody(f), [
+          { id: 'save_item',    title: 'Save' },
+          { id: 'edit_item',    title: 'Edit' },
+          { id: 'set_location', title: 'Set Location' }
+        ]);
+        res.sendStatus(200);
+        return;
+      }
+
+      // --- normal commands ---
       const cmd = verb;
 
       if (cmd === 'hi' || cmd === 'hello') {
@@ -488,12 +528,9 @@ app.post('/webhook', async (req, res) => {
           `• photo name:"ac_filter" url:https://link`,
           `• del name:"ac_filter"`,
           `• find screw 1.5in   OR   find category:electrical brand:Philips`,
-          `Tip: Use quotes for spaces → name:"A19 bulb"`,
           ``,
-          `📸 From photo flow:`,
-          `   • Tap *Set Location* (picker) or choose *Other…* and then type it`,
-          `   • or send:  loc <place>`,
-          `   • finally tap *Save*`
+          `📸 Photo flow: tap *Edit* to tweak fields, then *Save*.`,
+          `   Text edits: edit_name ..., edit_brand ..., edit_size ..., edit_cat ..., edit_qty ...`
         ].join('\n');
 
       } else if (cmd === 'add') {
